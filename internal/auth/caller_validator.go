@@ -19,10 +19,13 @@ import (
 )
 
 var (
-	ErrMissingAuthHeader = errors.New("missing or malformed Authorization header")
-	ErrMissingWorkspace  = errors.New("missing workspace context (specify X-Databricks-Workspace-Url or X-Databricks-Workspace-Id)")
-	ErrInvalidToken      = errors.New("caller token validation failed")
+	ErrMissingAuthHeader    = errors.New("missing or malformed Authorization header")
+	ErrMissingWorkspace     = errors.New("missing workspace context (specify X-Databricks-Workspace-Url or X-Databricks-Workspace-Id)")
+	ErrInvalidWorkspaceHost = errors.New("untrusted workspace URL host (must be a valid Databricks domain)")
+	ErrInvalidToken         = errors.New("caller token validation failed")
 )
+
+const maxCacheEntries = 2048
 
 type cachedIdentity struct {
 	identity  *models.CallerIdentity
@@ -65,6 +68,47 @@ func ExtractBearerToken(authHeader string) (string, error) {
 	return token, nil
 }
 
+// ValidateWorkspaceURL ensures the workspace URL points to a trusted Databricks domain (SSRF protection).
+func (v *CallerValidator) ValidateWorkspaceURL(rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(strings.TrimRight(rawURL, "/"))
+	if rawURL == "" {
+		return "", ErrMissingWorkspace
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "https://" + rawURL
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Hostname() == "" {
+		return "", fmt.Errorf("%w: malformed URL", ErrInvalidWorkspaceHost)
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+
+	// Trusted production Databricks domains
+	if strings.HasSuffix(host, ".cloud.databricks.com") ||
+		strings.HasSuffix(host, ".azuredatabricks.net") ||
+		strings.HasSuffix(host, ".gcp.databricks.com") ||
+		strings.HasSuffix(host, ".databricks.azure.cn") {
+		if parsed.Scheme != "https" {
+			return "", fmt.Errorf("%w: HTTPS is required for Databricks workspace URLs", ErrInvalidWorkspaceHost)
+		}
+		return fmt.Sprintf("https://%s", parsed.Host), nil
+	}
+
+	// Allow localhost / 127.0.0.1 only when DatabricksAccountsHost itself is configured for local testing
+	if v.cfg != nil {
+		if accParsed, err := url.Parse(v.cfg.DatabricksAccountsHost); err == nil {
+			accHost := strings.ToLower(accParsed.Hostname())
+			if (accHost == "127.0.0.1" || accHost == "localhost") && (host == "127.0.0.1" || host == "localhost") {
+				return fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("%w: '%s'", ErrInvalidWorkspaceHost, host)
+}
+
 // ValidateCaller validates the caller's token against the target workspace SCIM endpoint.
 func (v *CallerValidator) ValidateCaller(ctx context.Context, rawToken, workspaceURL string) (*models.CallerIdentity, error) {
 	return v.ValidateCallerWithClientID(ctx, rawToken, workspaceURL, "")
@@ -75,14 +119,12 @@ func (v *CallerValidator) ValidateCallerWithClientID(ctx context.Context, rawTok
 	if rawToken == "" {
 		return nil, ErrMissingAuthHeader
 	}
-	if workspaceURL == "" {
-		return nil, ErrMissingWorkspace
-	}
 
-	workspaceURL = strings.TrimRight(workspaceURL, "/")
-	if !strings.HasPrefix(workspaceURL, "http://") && !strings.HasPrefix(workspaceURL, "https://") {
-		workspaceURL = "https://" + workspaceURL
+	sanitizedWorkspaceURL, err := v.ValidateWorkspaceURL(workspaceURL)
+	if err != nil {
+		return nil, err
 	}
+	workspaceURL = sanitizedWorkspaceURL
 
 	// Check cache using SHA-256 of token + workspaceURL + clientID
 	cacheKey := tokenHash(rawToken, workspaceURL+":"+clientID)
@@ -202,15 +244,34 @@ func (v *CallerValidator) ValidateCallerWithClientID(ctx context.Context, rawTok
 		identity.IsServicePrincipal = false
 	}
 
-	// Cache the verified identity for the configured TTL
+	// Cache the verified identity for the configured TTL with bounded eviction
 	ttl := v.cfg.CacheTTL
 	if ttl <= 0 {
 		ttl = 60 * time.Second
 	}
+	now := time.Now()
 	v.cacheMu.Lock()
+	if len(v.cache) >= maxCacheEntries {
+		for k, entry := range v.cache {
+			if now.After(entry.expiresAt) {
+				delete(v.cache, k)
+			}
+		}
+		// If still full after pruning expired items, clear half the map
+		if len(v.cache) >= maxCacheEntries {
+			count := 0
+			for k := range v.cache {
+				delete(v.cache, k)
+				count++
+				if count >= maxCacheEntries/2 {
+					break
+				}
+			}
+		}
+	}
 	v.cache[cacheKey] = cachedIdentity{
 		identity:  identity,
-		expiresAt: time.Now().Add(ttl),
+		expiresAt: now.Add(ttl),
 	}
 	v.cacheMu.Unlock()
 

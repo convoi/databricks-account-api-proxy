@@ -1,13 +1,9 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strconv"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -24,9 +20,7 @@ func (s *ProxyServer) SetupRoutes() chi.Router {
 		reqID := GenerateRequestID()
 		s.auditLogger.Record(reqID, nil, "unknown", req.Method, req.URL.Path, "none",
 			models.DecisionDeny, "route not allowlisted (default deny)", http.StatusNotFound)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"route not allowlisted by proxy"}`))
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "route not allowlisted by proxy"})
 	})
 
 	// Default Deny for non-allowlisted HTTP methods on known paths
@@ -34,9 +28,7 @@ func (s *ProxyServer) SetupRoutes() chi.Router {
 		reqID := GenerateRequestID()
 		s.auditLogger.Record(reqID, nil, "unknown", req.Method, req.URL.Path, "none",
 			models.DecisionDeny, fmt.Sprintf("method %s not allowlisted on path (default deny)", req.Method), http.StatusMethodNotAllowed)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_, _ = w.Write([]byte(`{"error":"method not allowlisted by proxy"}`))
+		respondJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowlisted by proxy"})
 	})
 
 	// Health check endpoint
@@ -83,33 +75,58 @@ func (s *ProxyServer) SetupRoutes() chi.Router {
 	return r
 }
 
-// handleSPNOperation validates caller and evaluates Policy 1 (roles/servicePrincipal.manager)
-func (s *ProxyServer) handleSPNOperation(w http.ResponseWriter, r *http.Request) {
-	reqID := GenerateRequestID()
-	accountID := chi.URLParam(r, "account_id")
-	targetSPNID := chi.URLParam(r, "target_spn_id")
-	targetResource := fmt.Sprintf("spn:%s", targetSPNID)
-	policyName := "spn_manager"
+// authenticateAndCheckWhitelist centralizes:
+// 1. Account ID pinning validation (if DATABRICKS_ACCOUNT_ID is set)
+// 2. Bearer token extraction
+// 3. Workspace URL & ID resolution via shared cached WorkspaceResolver
+// 4. Caller identity introspection via SCIM Me (and Workload Identity exchange)
+// 5. Calling Service Principal workspace whitelist check
+func (s *ProxyServer) authenticateAndCheckWhitelist(
+	w http.ResponseWriter,
+	r *http.Request,
+	reqID, accountID, targetResource, policyName string,
+	requireWorkspaceID bool,
+) (*models.CallerIdentity, string, bool) {
+	// 1. Account ID Pinning Check
+	if s.cfg.DatabricksAccountID != "" && s.cfg.DatabricksAccountID != accountID {
+		reason := fmt.Sprintf("request account_id '%s' does not match proxy's configured account_id", accountID)
+		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
+			models.DecisionDeny, reason, http.StatusForbidden)
+		respondJSON(w, http.StatusForbidden, map[string]string{"error": reason})
+		return nil, "", false
+	}
 
-	// 1. Extract Bearer Token
+	// 2. Required Workspace ID check (for NCC operations)
+	workspaceID := r.Header.Get("X-Databricks-Workspace-Id")
+	if requireWorkspaceID && workspaceID == "" {
+		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
+			models.DecisionDeny, "missing required X-Databricks-Workspace-Id header", http.StatusBadRequest)
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Databricks-Workspace-Id header is required"})
+		return nil, "", false
+	}
+
+	// 3. Extract Bearer Token
 	rawToken, err := auth.ExtractBearerToken(r.Header.Get("Authorization"))
 	if err != nil {
 		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
 			models.DecisionDeny, "missing or malformed Authorization header", http.StatusUnauthorized)
 		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or malformed Authorization header"})
-		return
+		return nil, "", false
 	}
 
-	// 2. Resolve Workspace context for identity introspection
+	// 4. Resolve Workspace URL for caller identity introspection
 	workspaceURL := r.Header.Get("X-Databricks-Workspace-Url")
-	if workspaceURL == "" {
-		// If workspace ID is provided instead, resolve workspace deployment URL
-		wsID := r.Header.Get("X-Databricks-Workspace-Id")
-		if wsID != "" {
-			resolvedURL, err := s.resolveWorkspaceURL(r.Context(), accountID, wsID)
-			if err == nil {
-				workspaceURL = resolvedURL
+	if workspaceURL == "" && workspaceID != "" {
+		resolvedURL, err := s.nccPolicy.WorkspaceResolver().ResolveWorkspaceURL(r.Context(), accountID, workspaceID)
+		if err != nil {
+			if requireWorkspaceID {
+				s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
+					models.DecisionDeny, "failed to resolve workspace URL: "+err.Error(), http.StatusBadRequest)
+				respondJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to resolve workspace URL"})
+				return nil, "", false
 			}
+		} else {
+			workspaceURL = resolvedURL
 		}
 	}
 
@@ -117,24 +134,24 @@ func (s *ProxyServer) handleSPNOperation(w http.ResponseWriter, r *http.Request)
 		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
 			models.DecisionDeny, "missing workspace context (provide X-Databricks-Workspace-Url or X-Databricks-Workspace-Id)", http.StatusBadRequest)
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Databricks-Workspace-Url header required"})
-		return
+		return nil, "", false
 	}
 
-	// 3. Introspect and validate caller token (supporting Workload Identity)
+	// 5. Introspect and validate caller token (supporting Workload Identity & SSRF validation)
 	clientID := r.Header.Get("X-Databricks-Client-Id")
 	caller, err := s.validator.ValidateCallerWithClientID(r.Context(), rawToken, workspaceURL, clientID)
 	if err != nil {
 		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
 			models.DecisionDeny, "invalid caller token: "+err.Error(), http.StatusUnauthorized)
 		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "caller token validation failed: " + err.Error()})
-		return
+		return nil, "", false
 	}
 
-	// 4. Calling Service Principal Workspace Whitelist Check (Defense in Depth)
+	// 6. Calling Service Principal Workspace Whitelist Check (Defense in Depth)
 	if caller.IsServicePrincipal && s.whitelist.IsEnabled() {
-		targetWSID := r.Header.Get("X-Databricks-Workspace-Id")
+		targetWSID := workspaceID
 		if targetWSID == "" && workspaceURL != "" {
-			if resolvedID, err := s.resolveWorkspaceIDFromURL(r.Context(), accountID, workspaceURL); err == nil {
+			if resolvedID, err := s.nccPolicy.WorkspaceResolver().ResolveWorkspaceIDFromURL(r.Context(), accountID, workspaceURL); err == nil {
 				targetWSID = resolvedID
 			}
 		}
@@ -144,18 +161,35 @@ func (s *ProxyServer) handleSPNOperation(w http.ResponseWriter, r *http.Request)
 			respondJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "X-Databricks-Workspace-Id header is required to verify calling service principal workspace authorization",
 			})
-			return
+			return nil, "", false
 		}
 
 		if allowed, reason := s.whitelist.CheckSPNWorkspace(caller.PrincipalID, targetWSID); !allowed {
 			s.auditLogger.Record(reqID, caller, targetResource, r.Method, r.URL.Path, "spn_workspace_whitelist",
 				models.DecisionDeny, reason, http.StatusForbidden)
 			respondJSON(w, http.StatusForbidden, map[string]string{"error": reason})
-			return
+			return nil, "", false
 		}
+		workspaceID = targetWSID
 	}
 
-	// 5. Evaluate Policy 1 (roles/servicePrincipal.manager)
+	return caller, workspaceID, true
+}
+
+// handleSPNOperation validates caller and evaluates Policy 1 (roles/servicePrincipal.manager)
+func (s *ProxyServer) handleSPNOperation(w http.ResponseWriter, r *http.Request) {
+	reqID := GenerateRequestID()
+	accountID := chi.URLParam(r, "account_id")
+	targetSPNID := chi.URLParam(r, "target_spn_id")
+	targetResource := fmt.Sprintf("spn:%s", targetSPNID)
+	policyName := "spn_manager"
+
+	caller, _, ok := s.authenticateAndCheckWhitelist(w, r, reqID, accountID, targetResource, policyName, false)
+	if !ok {
+		return
+	}
+
+	// Evaluate Policy 1 (roles/servicePrincipal.manager)
 	allowed, reason, err := s.spnPolicy.VerifySPNManager(r.Context(), accountID, targetSPNID, caller)
 	if err != nil {
 		s.auditLogger.Record(reqID, caller, targetResource, r.Method, r.URL.Path, policyName,
@@ -171,7 +205,7 @@ func (s *ProxyServer) handleSPNOperation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 6. Authorized: Forward upstream with Account Admin credentials
+	// Authorized: Forward upstream with Account Admin credentials
 	s.forwardUpstream(w, r, reqID, caller, targetResource, policyName)
 }
 
@@ -183,58 +217,12 @@ func (s *ProxyServer) handleNCCOperation(w http.ResponseWriter, r *http.Request)
 	targetResource := fmt.Sprintf("ncc:%s", nccID)
 	policyName := "ncc_workspace_admin"
 
-	// 1. Required Header: X-Databricks-Workspace-Id
-	workspaceID := r.Header.Get("X-Databricks-Workspace-Id")
-	if workspaceID == "" {
-		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
-			models.DecisionDeny, "missing required X-Databricks-Workspace-Id header", http.StatusBadRequest)
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Databricks-Workspace-Id header is required"})
+	caller, workspaceID, ok := s.authenticateAndCheckWhitelist(w, r, reqID, accountID, targetResource, policyName, true)
+	if !ok {
 		return
 	}
 
-	// 2. Extract Bearer Token
-	rawToken, err := auth.ExtractBearerToken(r.Header.Get("Authorization"))
-	if err != nil {
-		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
-			models.DecisionDeny, "missing or malformed Authorization header", http.StatusUnauthorized)
-		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or malformed Authorization header"})
-		return
-	}
-
-	// 3. Resolve Workspace URL for caller validation
-	workspaceURL := r.Header.Get("X-Databricks-Workspace-Url")
-	if workspaceURL == "" {
-		resolvedURL, err := s.resolveWorkspaceURL(r.Context(), accountID, workspaceID)
-		if err != nil {
-			s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
-				models.DecisionDeny, "failed to resolve workspace URL: "+err.Error(), http.StatusBadRequest)
-			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to resolve workspace URL"})
-			return
-		}
-		workspaceURL = resolvedURL
-	}
-
-	// 4. Introspect and validate caller token (supporting Workload Identity)
-	clientID := r.Header.Get("X-Databricks-Client-Id")
-	caller, err := s.validator.ValidateCallerWithClientID(r.Context(), rawToken, workspaceURL, clientID)
-	if err != nil {
-		s.auditLogger.Record(reqID, nil, targetResource, r.Method, r.URL.Path, policyName,
-			models.DecisionDeny, "invalid caller token: "+err.Error(), http.StatusUnauthorized)
-		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "caller token validation failed: " + err.Error()})
-		return
-	}
-
-	// 5. Calling Service Principal Workspace Whitelist Check (Defense in Depth)
-	if caller.IsServicePrincipal && s.whitelist.IsEnabled() {
-		if allowed, reason := s.whitelist.CheckSPNWorkspace(caller.PrincipalID, workspaceID); !allowed {
-			s.auditLogger.Record(reqID, caller, targetResource, r.Method, r.URL.Path, "spn_workspace_whitelist",
-				models.DecisionDeny, reason, http.StatusForbidden)
-			respondJSON(w, http.StatusForbidden, map[string]string{"error": reason})
-			return
-		}
-	}
-
-	// 6. Evaluate Policy 2 (Workspace-to-NCC Binding, 1:1 Isolation, Workspace Admin)
+	// Evaluate Policy 2 (Workspace-to-NCC Binding, 1:1 Isolation, Workspace Admin)
 	allowed, reason, err := s.nccPolicy.VerifyNCCWorkspaceAdmin(r.Context(), accountID, nccID, workspaceID, caller)
 	if err != nil {
 		s.auditLogger.Record(reqID, caller, targetResource, r.Method, r.URL.Path, policyName,
@@ -250,107 +238,8 @@ func (s *ProxyServer) handleNCCOperation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 7. Authorized: Forward upstream with Account Admin credentials
+	// Authorized: Forward upstream with Account Admin credentials
 	s.forwardUpstream(w, r, reqID, caller, targetResource, policyName)
-}
-
-// resolveWorkspaceURL fetches workspace details to determine the deployment URL
-func (s *ProxyServer) resolveWorkspaceURL(ctx context.Context, accountID, workspaceID string) (string, error) {
-	adminToken, err := s.tokenManager.GetToken(ctx)
-	if err != nil {
-		return "", fmt.Errorf("admin token: %w", err)
-	}
-
-	host := strings.TrimRight(s.cfg.DatabricksAccountsHost, "/")
-	wsURL := fmt.Sprintf("%s/api/2.0/accounts/%s/workspaces/%s", host, accountID, workspaceID)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("workspace query returned %d: %s", resp.StatusCode, string(b))
-	}
-
-	var ws models.Workspace
-	if err := json.NewDecoder(resp.Body).Decode(&ws); err != nil {
-		return "", err
-	}
-
-	if ws.DeploymentName != "" {
-		lowerHost := strings.ToLower(s.cfg.DatabricksAccountsHost)
-		if strings.Contains(lowerHost, "azuredatabricks.net") {
-			return fmt.Sprintf("https://%s.azuredatabricks.net", ws.DeploymentName), nil
-		}
-		if strings.Contains(lowerHost, "gcp.databricks.com") {
-			return fmt.Sprintf("https://%s.gcp.databricks.com", ws.DeploymentName), nil
-		}
-		return fmt.Sprintf("https://%s.cloud.databricks.com", ws.DeploymentName), nil
-	}
-
-	return "", fmt.Errorf("deployment_name not present on workspace %s", workspaceID)
-}
-
-// resolveWorkspaceIDFromURL extracts deployment name from workspace URL and finds its workspace ID
-func (s *ProxyServer) resolveWorkspaceIDFromURL(ctx context.Context, accountID, wsURL string) (string, error) {
-	adminToken, err := s.tokenManager.GetToken(ctx)
-	if err != nil {
-		return "", fmt.Errorf("admin token: %w", err)
-	}
-
-	host := strings.TrimRight(s.cfg.DatabricksAccountsHost, "/")
-	allWsURL := fmt.Sprintf("%s/api/2.0/accounts/%s/workspaces", host, accountID)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, allWsURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("workspaces query returned %d: %s", resp.StatusCode, string(b))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var wsList []models.Workspace
-	if err := json.Unmarshal(body, &wsList); err != nil {
-		var wrapped struct {
-			Workspaces []models.Workspace `json:"workspaces"`
-		}
-		if err := json.Unmarshal(body, &wrapped); err != nil {
-			return "", err
-		}
-		wsList = wrapped.Workspaces
-	}
-
-	lowerWSURL := strings.ToLower(wsURL)
-	for _, ws := range wsList {
-		if ws.DeploymentName != "" && strings.Contains(lowerWSURL, strings.ToLower(ws.DeploymentName)) {
-			return strconv.FormatInt(ws.WorkspaceID, 10), nil
-		}
-	}
-
-	return "", fmt.Errorf("workspace with URL %s not found in account", wsURL)
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload any) {

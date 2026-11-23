@@ -108,6 +108,15 @@ func (c *Client) CreateFederationPolicy(ctx context.Context, targetSPNID string,
 	return &created, nil
 }
 
+func (c *Client) UpdateFederationPolicy(ctx context.Context, targetSPNID, policyID string, policy *FederationPolicy) (*FederationPolicy, error) {
+	path := fmt.Sprintf("/api/2.0/accounts/%s/servicePrincipals/%s/federationPolicies/%s", c.AccountID, targetSPNID, policyID)
+	var updated FederationPolicy
+	if err := c.doRequest(ctx, http.MethodPatch, path, policy, &updated); err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
 func (c *Client) DeleteFederationPolicy(ctx context.Context, targetSPNID, policyID string) error {
 	path := fmt.Sprintf("/api/2.0/accounts/%s/servicePrincipals/%s/federationPolicies/%s", c.AccountID, targetSPNID, policyID)
 	return c.doRequest(ctx, http.MethodDelete, path, nil, nil)
@@ -133,9 +142,37 @@ func (c *Client) CreatePrivateEndpointRule(ctx context.Context, nccID string, ru
 	return &created, nil
 }
 
+func (c *Client) UpdatePrivateEndpointRule(ctx context.Context, nccID, ruleID string, rule *PrivateEndpointRule) (*PrivateEndpointRule, error) {
+	path := fmt.Sprintf("/api/2.0/accounts/%s/network-connectivity-configs/%s/private-endpoint-rules/%s", c.AccountID, nccID, ruleID)
+	var updated PrivateEndpointRule
+	if err := c.doRequest(ctx, http.MethodPatch, path, rule, &updated); err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
 func (c *Client) DeletePrivateEndpointRule(ctx context.Context, nccID, ruleID string) error {
 	path := fmt.Sprintf("/api/2.0/accounts/%s/network-connectivity-configs/%s/private-endpoint-rules/%s", c.AccountID, nccID, ruleID)
 	return c.doRequest(ctx, http.MethodDelete, path, nil, nil)
+}
+
+// ErrNotFound indicates the target upstream resource returned HTTP 404.
+type ErrNotFound struct {
+	Path    string
+	Message string
+}
+
+func (e *ErrNotFound) Error() string {
+	return fmt.Sprintf("resource not found (%s): %s", e.Path, e.Message)
+}
+
+// IsNotFound checks if an error is an *ErrNotFound.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := err.(*ErrNotFound)
+	return ok
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, inPayload any, outResult any) error {
@@ -175,6 +212,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, inPayload a
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return &ErrNotFound{Path: path, Message: string(bodyBytes)}
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

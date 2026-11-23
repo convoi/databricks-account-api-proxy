@@ -3,15 +3,22 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"databricks-account-api-proxy/pkg/client"
 )
 
-var _ resource.Resource = &SPNFederationPolicyResource{}
+var (
+	_ resource.Resource                = &SPNFederationPolicyResource{}
+	_ resource.ResourceWithImportState = &SPNFederationPolicyResource{}
+)
 
 type SPNFederationPolicyResource struct {
 	client *client.Client
@@ -42,10 +49,16 @@ func (r *SPNFederationPolicyResource) Schema(ctx context.Context, req resource.S
 			"target_spn_id": schema.StringAttribute{
 				Description: "Application ID or Databricks ID of the target Service Principal.",
 				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 			"policy_id": schema.StringAttribute{
 				Description: "Unique policy identifier.",
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"name": schema.StringAttribute{
 				Description: "Human-readable name of the federation policy.",
@@ -124,12 +137,18 @@ func (r *SPNFederationPolicyResource) Read(ctx context.Context, req resource.Rea
 
 	pol, err := r.client.GetFederationPolicy(ctx, state.TargetSPNID.ValueString(), state.PolicyID.ValueString())
 	if err != nil {
+		if client.IsNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError("Error Reading Federation Policy", err.Error())
 		return
 	}
 
 	state.Name = types.StringValue(pol.Name)
-	state.Description = types.StringValue(pol.Description)
+	if pol.Description != "" || !state.Description.IsNull() {
+		state.Description = types.StringValue(pol.Description)
+	}
 	state.Issuer = types.StringValue(pol.Issuer)
 	state.Subject = types.StringValue(pol.Subject)
 
@@ -141,12 +160,36 @@ func (r *SPNFederationPolicyResource) Read(ctx context.Context, req resource.Rea
 }
 
 func (r *SPNFederationPolicyResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	// Re-create or apply update
 	var plan SPNFederationPolicyModel
+	var state SPNFederationPolicyModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	var audiences []string
+	resp.Diagnostics.Append(plan.Audiences.ElementsAs(ctx, &audiences, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	pol := &client.FederationPolicy{
+		PolicyID:    state.PolicyID.ValueString(),
+		Name:        plan.Name.ValueString(),
+		Description: plan.Description.ValueString(),
+		Issuer:      plan.Issuer.ValueString(),
+		Subject:     plan.Subject.ValueString(),
+		Audiences:   audiences,
+	}
+
+	_, err := r.client.UpdateFederationPolicy(ctx, plan.TargetSPNID.ValueString(), state.PolicyID.ValueString(), pol)
+	if err != nil {
+		resp.Diagnostics.AddError("Error Updating Federation Policy", err.Error())
+		return
+	}
+
+	plan.PolicyID = state.PolicyID
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -158,8 +201,23 @@ func (r *SPNFederationPolicyResource) Delete(ctx context.Context, req resource.D
 	}
 
 	err := r.client.DeleteFederationPolicy(ctx, state.TargetSPNID.ValueString(), state.PolicyID.ValueString())
-	if err != nil {
+	if err != nil && !client.IsNotFound(err) {
 		resp.Diagnostics.AddError("Error Deleting Federation Policy", err.Error())
 		return
 	}
+}
+
+func (r *SPNFederationPolicyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Expected format: "<target_spn_id>/<policy_id>"
+	parts := strings.SplitN(req.ID, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		resp.Diagnostics.AddError(
+			"Invalid Import ID",
+			"Expected import identifier in format: <target_spn_id>/<policy_id>",
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("target_spn_id"), parts[0])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("policy_id"), parts[1])...)
 }

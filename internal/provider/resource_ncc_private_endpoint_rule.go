@@ -3,15 +3,22 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"databricks-account-api-proxy/pkg/client"
 )
 
-var _ resource.Resource = &NCCPrivateEndpointRuleResource{}
+var (
+	_ resource.Resource                = &NCCPrivateEndpointRuleResource{}
+	_ resource.ResourceWithImportState = &NCCPrivateEndpointRuleResource{}
+)
 
 type NCCPrivateEndpointRuleResource struct {
 	client *client.Client
@@ -41,18 +48,30 @@ func (r *NCCPrivateEndpointRuleResource) Schema(ctx context.Context, req resourc
 			"ncc_id": schema.StringAttribute{
 				Description: "Network Connectivity Config ID.",
 				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 			"rule_id": schema.StringAttribute{
 				Description: "Private Endpoint Rule ID.",
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"resource_id": schema.StringAttribute{
 				Description: "Cloud resource ID of the target service (e.g. Azure Storage / AWS VPC Endpoint Service).",
 				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 			"group_id": schema.StringAttribute{
 				Description: "Sub-resource / group ID (e.g. 'blob', 'dfs', 'sqlServer').",
 				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 			"endpoint_name": schema.StringAttribute{
 				Description: "Descriptive name for the endpoint rule.",
@@ -111,13 +130,19 @@ func (r *NCCPrivateEndpointRuleResource) Read(ctx context.Context, req resource.
 
 	rule, err := r.client.GetPrivateEndpointRule(ctx, state.NCCID.ValueString(), state.RuleID.ValueString())
 	if err != nil {
+		if client.IsNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError("Error Reading Private Endpoint Rule", err.Error())
 		return
 	}
 
 	state.ResourceID = types.StringValue(rule.ResourceID)
 	state.GroupID = types.StringValue(rule.GroupID)
-	state.EndpointName = types.StringValue(rule.EndpointName)
+	if rule.EndpointName != "" || !state.EndpointName.IsNull() {
+		state.EndpointName = types.StringValue(rule.EndpointName)
+	}
 	state.ConnectionState = types.StringValue(rule.ConnectionState)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -125,10 +150,28 @@ func (r *NCCPrivateEndpointRuleResource) Read(ctx context.Context, req resource.
 
 func (r *NCCPrivateEndpointRuleResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan NCCPrivateEndpointRuleModel
+	var state NCCPrivateEndpointRuleModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	rule := &client.PrivateEndpointRule{
+		RuleID:       state.RuleID.ValueString(),
+		ResourceID:   plan.ResourceID.ValueString(),
+		GroupID:      plan.GroupID.ValueString(),
+		EndpointName: plan.EndpointName.ValueString(),
+	}
+
+	updated, err := r.client.UpdatePrivateEndpointRule(ctx, plan.NCCID.ValueString(), state.RuleID.ValueString(), rule)
+	if err != nil {
+		resp.Diagnostics.AddError("Error Updating Private Endpoint Rule", err.Error())
+		return
+	}
+
+	plan.RuleID = state.RuleID
+	plan.ConnectionState = types.StringValue(updated.ConnectionState)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -140,8 +183,23 @@ func (r *NCCPrivateEndpointRuleResource) Delete(ctx context.Context, req resourc
 	}
 
 	err := r.client.DeletePrivateEndpointRule(ctx, state.NCCID.ValueString(), state.RuleID.ValueString())
-	if err != nil {
+	if err != nil && !client.IsNotFound(err) {
 		resp.Diagnostics.AddError("Error Deleting Private Endpoint Rule", err.Error())
 		return
 	}
+}
+
+func (r *NCCPrivateEndpointRuleResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Expected format: "<ncc_id>/<rule_id>"
+	parts := strings.SplitN(req.ID, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		resp.Diagnostics.AddError(
+			"Invalid Import ID",
+			"Expected import identifier in format: <ncc_id>/<rule_id>",
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("ncc_id"), parts[0])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("rule_id"), parts[1])...)
 }

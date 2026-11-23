@@ -448,3 +448,49 @@ spn_workspace_whitelist:
 		t.Fatalf("expected 201 Created for allowed workspace, got %d: %s", resp2.StatusCode, string(b))
 	}
 }
+
+func TestProxy_AccountIDPinningAndSSRFProtection(t *testing.T) {
+	proxyServer, _, auditBuf := setupTestProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// 1. Account ID mismatch (setupTestProxy configures DatabricksAccountID = "test-acc-1")
+	req1, _ := http.NewRequest(http.MethodGet,
+		proxyServer.URL+"/api/2.0/accounts/wrong-account-id/servicePrincipals/spn-1", nil)
+	req1.Header.Set("Authorization", "Bearer valid-token")
+	req1.Header.Set("X-Databricks-Workspace-Url", "https://my-ws.cloud.databricks.com")
+
+	resp1, err := proxyServer.Client().Do(req1)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for mismatched account_id, got %d", resp1.StatusCode)
+	}
+	if !strings.Contains(auditBuf.String(), "does not match proxy's configured account_id") {
+		t.Errorf("expected account_id mismatch reason in audit log, got: %s", auditBuf.String())
+	}
+
+	// 2. SSRF attempt via untrusted X-Databricks-Workspace-Url
+	auditBuf.Reset()
+	req2, _ := http.NewRequest(http.MethodGet,
+		proxyServer.URL+"/api/2.0/accounts/test-acc-1/servicePrincipals/spn-1", nil)
+	req2.Header.Set("Authorization", "Bearer valid-token")
+	req2.Header.Set("X-Databricks-Workspace-Url", "http://169.254.169.254/latest/meta-data")
+
+	resp2, err := proxyServer.Client().Do(req2)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for untrusted SSRF workspace URL, got %d", resp2.StatusCode)
+	}
+	if !strings.Contains(auditBuf.String(), "untrusted workspace URL host") {
+		t.Errorf("expected SSRF host rejection in audit log, got: %s", auditBuf.String())
+	}
+}
+

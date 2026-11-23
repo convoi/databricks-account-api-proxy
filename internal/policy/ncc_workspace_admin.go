@@ -21,9 +21,10 @@ import (
 // 2. 1:1 Isolation Check (Blast Radius Prevention across all workspaces)
 // 3. Workspace Admin Verification (member of 'admins' group)
 type NCCWorkspaceAdminPolicy struct {
-	cfg          *config.Config
-	tokenManager *auth.AdminTokenManager
-	httpClient   *http.Client
+	cfg               *config.Config
+	tokenManager      *auth.AdminTokenManager
+	workspaceResolver *WorkspaceResolver
+	httpClient        *http.Client
 }
 
 // NewNCCWorkspaceAdminPolicy creates a new NCC policy evaluator.
@@ -32,10 +33,16 @@ func NewNCCWorkspaceAdminPolicy(cfg *config.Config, tokenMgr *auth.AdminTokenMan
 		httpClient = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &NCCWorkspaceAdminPolicy{
-		cfg:          cfg,
-		tokenManager: tokenMgr,
-		httpClient:   httpClient,
+		cfg:               cfg,
+		tokenManager:      tokenMgr,
+		workspaceResolver: NewWorkspaceResolver(cfg, tokenMgr, httpClient),
+		httpClient:        httpClient,
 	}
+}
+
+// WorkspaceResolver returns the policy's shared WorkspaceResolver.
+func (p *NCCWorkspaceAdminPolicy) WorkspaceResolver() *WorkspaceResolver {
+	return p.workspaceResolver
 }
 
 // VerifyNCCWorkspaceAdmin runs all 3 checks. Returns (allowed, denialReason, error).
@@ -62,40 +69,13 @@ func (p *NCCWorkspaceAdminPolicy) VerifyNCCWorkspaceAdmin(
 		return false, "failed to obtain account admin token", fmt.Errorf("admin token: %w", err)
 	}
 
-	host := strings.TrimRight(p.cfg.DatabricksAccountsHost, "/")
-
 	// --- Check 1: Workspace-to-NCC Binding ---
-	wsURL := fmt.Sprintf("%s/api/2.0/accounts/%s/workspaces/%s", host, accountID, workspaceID)
-	req1, err := http.NewRequestWithContext(ctx, http.MethodGet, wsURL, nil)
+	targetWS, err := p.workspaceResolver.GetWorkspace(ctx, accountID, workspaceID)
 	if err != nil {
-		return false, "failed to create workspace query request", fmt.Errorf("new request: %w", err)
+		return false, "failed to query workspace details", fmt.Errorf("get workspace: %w", err)
 	}
-	req1.Header.Set("Authorization", "Bearer "+adminToken)
-	req1.Header.Set("Accept", "application/json")
-
-	resp1, err := p.httpClient.Do(req1)
-	if err != nil {
-		return false, "failed to query workspace details", fmt.Errorf("do request: %w", err)
-	}
-	defer resp1.Body.Close()
-
-	if resp1.StatusCode == http.StatusNotFound {
+	if targetWS == nil {
 		return false, fmt.Sprintf("workspace '%s' not found", workspaceID), nil
-	}
-	if resp1.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp1.Body)
-		return false, fmt.Sprintf("workspace query returned status %d", resp1.StatusCode),
-			fmt.Errorf("status %d: %s", resp1.StatusCode, string(b))
-	}
-
-	body1, err := io.ReadAll(resp1.Body)
-	if err != nil {
-		return false, "failed to read workspace response", fmt.Errorf("read: %w", err)
-	}
-
-	var targetWS models.Workspace
-	if err := json.Unmarshal(body1, &targetWS); err != nil {
-		return false, "failed to parse workspace response", fmt.Errorf("unmarshal: %w", err)
 	}
 
 	if targetWS.NetworkConnectivityConfigID == "" || targetWS.NetworkConnectivityConfigID != nccID {
@@ -104,38 +84,13 @@ func (p *NCCWorkspaceAdminPolicy) VerifyNCCWorkspaceAdmin(
 	}
 
 	// --- Check 2: 1:1 Isolation Check (Blast Radius Prevention) ---
-	allWsURL := fmt.Sprintf("%s/api/2.0/accounts/%s/workspaces", host, accountID)
-	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, allWsURL, nil)
+	workspaces, err := p.workspaceResolver.ListWorkspaces(ctx, accountID)
 	if err != nil {
-		return false, "failed to create all workspaces query request", fmt.Errorf("new request: %w", err)
-	}
-	req2.Header.Set("Authorization", "Bearer "+adminToken)
-	req2.Header.Set("Accept", "application/json")
-
-	resp2, err := p.httpClient.Do(req2)
-	if err != nil {
-		return false, "failed to query workspaces list", fmt.Errorf("do request: %w", err)
-	}
-	defer resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp2.Body)
-		return false, fmt.Sprintf("workspaces list query returned status %d", resp2.StatusCode),
-			fmt.Errorf("status %d: %s", resp2.StatusCode, string(b))
-	}
-
-	body2, err := io.ReadAll(resp2.Body)
-	if err != nil {
-		return false, "failed to read workspaces list", fmt.Errorf("read: %w", err)
-	}
-
-	workspaces, err := parseWorkspacesList(body2)
-	if err != nil {
-		return false, "failed to parse workspaces list", fmt.Errorf("parse workspaces: %w", err)
+		return false, "failed to query workspaces list", fmt.Errorf("list workspaces: %w", err)
 	}
 
 	var boundWorkspaces []string
-	cleanTargetID := strings.TrimPrefix(workspaceID, "ws-")
+	cleanTargetID := strings.TrimPrefix(strings.TrimPrefix(workspaceID, "ws-"), "WS-")
 
 	for _, ws := range workspaces {
 		if ws.NetworkConnectivityConfigID == nccID {
