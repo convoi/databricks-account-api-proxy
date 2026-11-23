@@ -3,7 +3,7 @@ FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=0.1.0
+ARG VERSION=0.1.1
 
 WORKDIR /build
 

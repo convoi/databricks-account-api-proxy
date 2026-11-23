@@ -17,7 +17,7 @@ import (
 	"databricks-account-api-proxy/internal/whitelist"
 )
 
-var version = "0.1.0"
+var version = "0.1.1"
 
 func main() {
 	// Configure structured JSON logger for application events
