@@ -1,0 +1,9 @@
+.idea/
+*.iml
+proxy
+proxy.exe
+terraform-provider-databricks-proxy
+terraform-provider-databricks-proxy.exe
+dist/
+config.yaml
+.env
