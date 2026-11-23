@@ -1,5 +1,9 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG VERSION=0.1.0
 
 WORKDIR /build
 
@@ -13,13 +17,13 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build statically compiled binaries
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-s -w -X main.version=0.1.0" \
+# Build statically compiled binaries for target platform
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w -X main.version=${VERSION}" \
     -o /build/proxy ./cmd/proxy
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-s -w -X main.version=0.1.0" \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w -X main.version=${VERSION}" \
     -o /build/terraform-provider-databricks-proxy ./cmd/terraform-provider-databricks-proxy
 
 # Production runtime stage
