@@ -1,0 +1,19 @@
+# Example configuration file for Databricks Account API Scoped Proxy
+# Path can be specified via PROXY_CONFIG_FILE or CONFIG_FILE environment variable,
+# or default 'config.yaml' in the application working directory.
+
+# Whitelist mapping of "calling service principal" (applicationId / UUID)
+# to the list of Databricks workspace IDs that it is allowed to manage.
+spn_workspace_whitelist:
+  # Data Engineering CI/CD Service Principal
+  "11111111-2222-3333-4444-555555555555":
+    - "1234567890123456" # Dev Workspace
+    - "9876543210987654" # Staging Workspace
+
+  # Machine Learning Operations SPN (single workspace)
+  "aaaa-bbbb-cccc-dddd-eeeeeeeeeeee":
+    - "1234567890123456"
+
+  # SPN permitted across all workspaces in this account (wildcard support)
+  "00000000-0000-0000-0000-000000000001":
+    - "*"
