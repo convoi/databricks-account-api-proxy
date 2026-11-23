@@ -25,32 +25,32 @@ sequenceDiagram
     participant Accounts as Databricks Account API
 
     Caller->>Proxy: Request (Bearer caller_token, X-Databricks-Workspace-*)
-    Note over Proxy: 1. Caller Authentication
+    Note over Proxy: 1. Caller Authentication & SPN Whitelist Check
     Proxy->>WS: GET /api/2.0/preview/scim/v2/Me (caller_token)
     WS-->>Proxy: SCIM Identity (Principal ID, numeric ID, groups)
     
-    Note over Proxy: 2. Policy Evaluation
-    alt Policy 1: SPN Federation Policies
-        Proxy->>Accounts: GET access-control/rule-sets/accounts/{acc}/servicePrincipals/{spn} (admin_token)
+    Note over Proxy: 2. Dynamic RBAC Policy Evaluation
+    alt Policy 1 - SPN Federation Policies
+        Proxy->>Accounts: GET access-control/rule-sets/.../servicePrincipals/target_spn (admin_token)
         Accounts-->>Proxy: Rule Set (roles/servicePrincipal.manager)
-        Note over Proxy: Check caller principal or caller groups in grant_rules
-    else Policy 2: NCC Private Endpoint Rules
-        Proxy->>Accounts: GET accounts/{acc}/workspaces/{ws_id} (admin_token)
+        Note over Proxy: Verify caller principal or group in grant_rules
+    else Policy 2 - NCC Private Endpoint Rules
+        Proxy->>Accounts: GET accounts/acc_id/workspaces/ws_id (admin_token)
         Accounts-->>Proxy: Workspace NCC binding
-        Proxy->>Accounts: GET accounts/{acc}/workspaces (admin_token)
-        Accounts-->>Proxy: All workspaces (Verify 1:1 isolation check)
-        Proxy->>WS: Verify caller in 'admins' group
+        Proxy->>Accounts: GET accounts/acc_id/workspaces (admin_token)
+        Accounts-->>Proxy: All workspaces (Verify 1 to 1 isolation check)
+        Proxy->>WS: Verify caller in admins group
     end
 
     alt Authorization Passed
         Note over Proxy: 3. Upstream Forwarding
-        Proxy->>Accounts: Forward request (Strip caller token; Inject privileged Admin token)
+        Proxy->>Accounts: Forward request (Strip caller token and inject privileged Admin token)
         Accounts-->>Proxy: Upstream response
         Proxy-->>Caller: Proxied response + HTTP status
-        Note over Proxy: Audit Log: ALLOW
+        Note over Proxy: Audit Log - ALLOW
     else Authorization Failed
-        Proxy-->>Caller: 403 Forbidden {"error": "..."}
-        Note over Proxy: Audit Log: DENY
+        Proxy-->>Caller: 403 Forbidden (JSON error response)
+        Note over Proxy: Audit Log - DENY
     end
 ```
 
