@@ -1,5 +1,11 @@
 # Databricks Account API Scoped RBAC Proxy & Terraform Provider
 
+[![CI Status](https://github.com/convoi/databricks-account-api-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/convoi/databricks-account-api-proxy/actions/workflows/ci.yml)
+[![Release Status](https://github.com/convoi/databricks-account-api-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/convoi/databricks-account-api-proxy/actions/workflows/release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/convoi/databricks-account-api-proxy?logo=github&label=Release)](https://github.com/convoi/databricks-account-api-proxy/releases/latest)
+[![Docker Image (GHCR)](https://img.shields.io/badge/ghcr.io-convoi%2Fdatabricks--account--api--proxy-blue?logo=docker)](https://github.com/convoi/databricks-account-api-proxy/pkgs/container/databricks-account-api-proxy)
+[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-brightgreen.svg)](https://unlicense.org/)
+
 A high-performance, secure HTTP reverse-proxy and authorization broker written in **Go** that allows non-Account-Admin Databricks users and Service Principals (SPNs) to execute a strictly allowlisted subset of Databricks Account API operations, governed by dynamic RBAC checks.
 
 It also includes a companion **Terraform Provider** (`terraform-provider-databricks-proxy`) built with HashiCorp's `terraform-plugin-framework` to allow teams to manage federation policies and private endpoint rules natively via Infrastructure-as-Code without needing Account Admin privileges.
@@ -144,9 +150,12 @@ export PROXY_CLIENT_SECRET="<admin-spn-secret>"
 ./proxy
 ```
 
-### Docker
+### Docker ([GitHub Container Registry Package](https://github.com/convoi/databricks-account-api-proxy/pkgs/container/databricks-account-api-proxy))
 ```bash
-# Build Docker image
+# Pull pre-built multi-arch image (linux/amd64, linux/arm64) from GHCR
+docker pull ghcr.io/convoi/databricks-account-api-proxy:latest
+
+# Or build locally
 docker build -t databricks-account-api-proxy:latest .
 
 # Run container (non-root UID 10001)
@@ -154,7 +163,7 @@ docker run -d \
   -p 8080:8080 \
   -e PROXY_CLIENT_ID="<client-id>" \
   -e PROXY_CLIENT_SECRET="<client-secret>" \
-  databricks-account-api-proxy:latest
+  ghcr.io/convoi/databricks-account-api-proxy:latest
 ```
 
 ---
